@@ -1,0 +1,435 @@
+import groovy.json.JsonSlurper
+import groovy.json.JsonBuilder
+pipeline {
+    agent { docker { image 'picnex000.dom101.mapres:8082/build-ansible:2.8.2' } }
+
+    environment {
+          GIT_PROJECT = ''
+          GIT_REPO = ''
+          GIT_FULL_URL = ''
+          TOWER_URL = "https://tower.mycloud.intrabpce.fr/api/v2"
+          SYSCOMP_URL = "https://bitbucket.f.bbg/scm/bpce-it-cldprv-ans/mycloud-syscompliance.git"
+          SUBSCRIBE_URL = "https://bitbucket.f.bbg/scm/bpce-it-cldprv-ans/mycloud-subscribe.git"
+          MIDDLEWARE_URL = "https://bitbucket.f.bbg/scm/bpce-it-cldprv-ans/playbooks-middleware.git"
+          newRoleVersion = ''
+          newVersion = ''
+    }
+
+    stages {
+        stage('Init') {
+            steps {
+                script {
+                    GIT_FULL_URL = scm.getUserRemoteConfigs()[0].getUrl()
+                    GIT_PROJECT = scm.getUserRemoteConfigs()[0].getUrl().tokenize('/')[3].split("\\.")[0]
+                    GIT_REPO = scm.getUserRemoteConfigs()[0].getUrl().tokenize('/')[4].split("\\.")[0]
+               }
+            }
+            post {
+                failure {
+                  deleteDir()
+                }
+            }
+        }
+
+
+        stage('Deploy on test VM') {
+            steps {
+                script {
+                    currentBuild.description = "Role ${GIT_REPO} "
+                    withCredentials([string(credentialsId: 'jenkins2tow', variable: 'TOKEN')]) {
+                        switch(GIT_REPO) {
+                        case  ~/^sys-.*/:
+                            job="sysComp"
+                            launchType="job_templates"
+                            getType="jobs"
+                            jobId=67
+                            limit="bilppod0009m.prv.cloud"
+                            extra_vars=""
+                            if (! fileExists('meta/main.yml')) {
+                                currentBuild.result = 'FAILED'
+                                currentBuild.description = "Missing meta/main.yml"
+                                error("Missing meta/main.yml")
+                            }
+                            def json = """\
+                                        {
+                                            "limit": "${limit}",
+                                            "extra_vars": {
+						    "___internal": {
+							    "launched_by_repo": "${GIT_REPO}",
+							    "launched_by_job": "${JOB_URL}",
+							    "launched_by_build": "${BUILD_URL}"
+						   }
+					    }
+                                        }
+                                        """
+                            def launch = sh(
+                                    script: "curl \
+                                                -X POST \
+                                                -H 'Content-Type:application/json' \
+                                                -H 'Authorization: Bearer ${TOKEN}' -k \
+                                                -d '${json}' \
+                                                ${TOWER_URL}/${launchType}/${jobId}/launch/",
+                                    returnStdout: true)
+
+                            def launchId = new JsonSlurper().parseText(launch).id
+                            currentBuild.description += "(Job ${launchId}) "
+                            def jobStatus = ''
+
+			    def i = 0
+                            while(jobStatus != 'successful') {
+                                def jobOutput = sh(
+                                    script: "curl \
+                                                -X GET \
+                                                -H 'Content-Type:application/json' \
+                                                -H 'Authorization: Bearer ${TOKEN}' -k \
+                                                ${TOWER_URL}/${getType}/${launchId}/",
+                                    returnStdout: true)
+                                jobStatus = new JsonSlurper().parseText(jobOutput).status
+                                println jobStatus
+                                if( jobStatus == "failed" || jobStatus == "error" || jobStatus == "canceled" ) {
+                                    currentBuild.result = 'FAILED'
+                                    currentBuild.description += "KO"
+                                    rror("Ansible deployment KO")
+                                    }
+				i++
+				if (i == 60) {
+                                    currentBuild.result = 'FAILED'
+                                    currentBuild.description += "KO: Took too long"
+                                    error("Ansible deployment too long")
+				}
+                                sleep(15)
+                            }
+                            currentBuild.description += "OK"
+
+                        default:
+                            datas = readYaml (file: '.jenkins')
+                            plays = datas['plays']
+                            plays.each { p ->
+                                jobType=p.getAt('type').toString()
+                                switch(jobType) {
+                                    case  ~/template/:
+                                        launchType="job_templates"
+                                        getType="jobs"
+                                        break
+                                    case ~/workflow/:
+                                        launchType="workflow_job_templates"
+                                        getType="workflow_jobs"
+                                        break
+                                }
+                                jobId=p.getAt('jobid').toString()
+                                jobName=p.getAt('jobname').toString()
+                                currentBuild.description += "\n ${jobName} "
+                                limit=p.getAt('limit').toString()
+                                extra_vars=p.getAt('extra_vars')
+                                extra_vars['___internal'] = [
+				        launched_by_repo: "${GIT_REPO}",
+					launched_by_job: "${JOB_URL}",
+					launched_by_build: "${BUILD_URL}"
+				]
+                                extra_vars=new groovy.json.JsonBuilder(extra_vars).toPrettyString()
+
+                                def json = """\
+                                        {
+                                            "limit": "${limit}",
+                                            "extra_vars": ${extra_vars}
+                                        }
+                                        """
+
+                                def launch = sh(
+                                    script: "curl \
+                                                -X POST \
+                                                -H 'Content-Type:application/json' \
+                                                -H 'Authorization: Bearer ${TOKEN}' -k \
+                                                -d '${json}' \
+                                                ${TOWER_URL}/${launchType}/${jobId}/launch/",
+                                    returnStdout: true)
+
+                                def launchId = new JsonSlurper().parseText(launch).id
+                                currentBuild.description += "(Job ${launchId}) "
+                                def jobStatus = ''
+
+				def i = 0
+                                while(jobStatus != 'successful') {
+                                    def jobOutput = sh(
+                                        script: "curl \
+                                                    -X GET \
+                                                    -H 'Content-Type:application/json' \
+                                                    -H 'Authorization: Bearer ${TOKEN}' -k \
+                                                    ${TOWER_URL}/${getType}/${launchId}/",
+                                        returnStdout: true)
+                                    jobStatus = new JsonSlurper().parseText(jobOutput).status
+                                    println jobStatus
+                                    if( jobStatus == "failed" || jobStatus == "error" || jobStatus == "canceled" ) {
+                                        currentBuild.result = 'FAILED'
+                                        currentBuild.description += "KO"
+                                        error("Ansible deployment KO")
+                                        }
+				    i++
+				    if (i == 60) {
+					currentBuild.result = 'FAILED'
+					currentBuild.description += "KO: Took too long"
+					error("Ansible deployment too long")
+				    }
+                                    sleep(15)
+                                }
+                                currentBuild.description += "OK"
+
+                            }
+                        }
+                    }
+                }
+            }
+            post {
+                failure {
+                  deleteDir()
+                }
+            }
+         }
+
+        stage('Get latest tag') {
+               when {
+                    allOf {
+                        branch 'develop';
+                        expression {
+                            GIT_REPO.startsWith("sys-") || GIT_REPO.equals("mycloud-syscompliance") || GIT_REPO.startsWith("csa-") || GIT_REPO.equals("mycloud-subscribe") || GIT_REPO.startsWith("mdw-") || GIT_REPO.equals("mycloud-datadisk")
+                        }
+                    }
+
+            }
+            steps {
+                script {
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'svccldprvans', usernameVariable: 'GIT_USERNAME', passwordVariable: 'GIT_PASSWORD']]) {
+                        git url: "${GIT_FULL_URL}",
+                          credentialsId: 'svccldprvans',
+                          branch: "${GIT_BRANCH}"
+                        def latestVersion = sh(
+                            returnStdout: true,
+                            script: 'git describe --tags "$(git rev-list --tags --max-count=1 2> /dev/null)" 2> /dev/null || echo v0'
+                        )
+
+                        newRoleVersion = "v" + (Integer.parseInt(latestVersion.trim().substring(1)) + 1)
+                        currentBuild.description += "\n Role New Tag : ${newRoleVersion} ;"
+                   }
+                }
+            }
+            post {
+                failure {
+                  deleteDir()
+                }
+            }
+        }
+
+        stage('Push new Role tag') {
+               when {
+                    allOf {
+                        branch 'develop';
+                        expression {
+                            GIT_REPO.startsWith("sys-") || GIT_REPO.startsWith("csa-") || GIT_REPO.equals("mycloud-syscompliance") || GIT_REPO.startsWith("mdw-") || GIT_REPO.equals("mycloud-datadisk") || GIT_REPO.equals("mycloud-subscribe")
+                        }
+                    }
+
+            }
+            steps {
+
+                withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'svccldprvans', usernameVariable: 'GIT_USERNAME', passwordVariable: 'GIT_PASSWORD']]) {
+                    sh('git config --global user.email "jenkins-ci@bpce-it.fr"')
+                    sh('git config --global user.name "Jenkins CI"')
+                    sh('git config --local credential.helper "!f() { echo username=\\$GIT_USERNAME; echo password=\\$GIT_PASSWORD; }; f"')
+                    sh("git commit --allow-empty -am 'Updated: Role ${GIT_REPO} to version ${newRoleVersion}'")
+                    sh('git config --global push.default simple')
+                    //sh("git tag -f ${newRoleVersion};git push --tags -f && git push origin HEAD:master" )
+                    sh("git checkout master;git merge develop;git tag ${newRoleVersion} master;git push --tags origin HEAD:master")
+                }
+                deleteDir()
+                   }
+            post {
+
+                failure {
+                  deleteDir()
+                }
+            }
+        }
+
+        stage('Update SysComp roles/requirements') {
+             when {
+                    allOf {
+                        branch 'develop';
+                        expression {
+                            GIT_REPO.startsWith("sys-")
+                        }
+                    }
+
+            }
+
+
+            steps {
+
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "master"]],
+                    doGenerateSubmoduleConfigurations: false,
+                    extensions: [],
+                    submoduleCfg: [],
+                    userRemoteConfigs: [[credentialsId: 'svccldprvans', url: "${SYSCOMP_URL}"]]
+                ])
+                script {
+
+                    def filename = 'roles/requirements.yml'
+                    def data = readYaml file: filename
+                    data.eachWithIndex { req, index  ->
+                      repoName=req.getAt('name').toString()
+                      version=req.getAt('version').toString()
+                      if( repoName == GIT_REPO) {
+                         data[index].version = newRoleVersion
+                      }
+                    }
+                    sh "rm $filename"
+                    writeYaml file: filename, data: data
+
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'svccldprvans', usernameVariable: 'GIT_USERNAME', passwordVariable: 'GIT_PASSWORD']]) {
+                            def latestVersion = sh(
+                                        returnStdout: true,
+                                        script: 'git describe --tags "$(git rev-list --tags --max-count=1 2> /dev/null)" 2> /dev/null || echo v0'
+                                    )
+
+                            newVersion = "v" + (Integer.parseInt(latestVersion.trim().substring(1)) + 1)
+                            currentBuild.description += " SysComp Tag : ${newVersion}"
+                            sh('git config --global user.email "jenkins-ci@bpce-it.fr"')
+                            sh('git config --global user.name "Jenkins CI"')
+                            sh('git config --local credential.helper "!f() { echo username=\\$GIT_USERNAME; echo password=\\$GIT_PASSWORD; }; f"')
+                            sh('git config --global push.default simple')
+                            sh("git commit --allow-empty -am 'Updated: Role ${GIT_REPO} to version ${newRoleVersion}'")
+                            sh("git tag $newVersion;git push --tags origin HEAD:master")
+                    }
+                }
+            }
+            post {
+                always {
+                    deleteDir()
+                }
+            }
+        }
+        stage('Update Subscribe roles/requirements') {
+             when {
+                    allOf {
+                        branch 'develop';
+                        expression {
+                            GIT_REPO.equals("sys-setdns") || GIT_REPO.startsWith("csa-") || GIT_REPO.equals("sys-resolv")
+                        }
+                    }
+
+            }
+
+            steps {
+
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "master"]],
+                    doGenerateSubmoduleConfigurations: false,
+                    extensions: [],
+                    submoduleCfg: [],
+                    userRemoteConfigs: [[credentialsId: 'svccldprvans', url: "${SUBSCRIBE_URL}"]]
+                ])
+                script {
+
+                    def filename = 'roles/requirements.yml'
+                    def data = readYaml file: filename
+                    data.eachWithIndex { req, index  ->
+                      repoName=req.getAt('name').toString()
+                      version=req.getAt('version').toString()
+                      if( repoName == GIT_REPO) {
+                         println data
+                         println repoName
+                         data[index].version = newRoleVersion
+                      }
+                    }
+                    sh "rm $filename"
+                    writeYaml file: filename, data: data
+
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'svccldprvans', usernameVariable: 'GIT_USERNAME', passwordVariable: 'GIT_PASSWORD']]) {
+                            def latestVersion = sh(
+                                        returnStdout: true,
+                                        script: 'git describe --tags "$(git rev-list --tags --max-count=1 2> /dev/null)" 2> /dev/null || echo v0'
+                                    )
+
+                            newVersion = "v" + (Integer.parseInt(latestVersion.trim().substring(1)) + 1)
+                            currentBuild.description += " Subscribe Tag : ${newVersion}"
+                            sh('git config --global user.email "jenkins-ci@bpce-it.fr"')
+                            sh('git config --global user.name "Jenkins CI"')
+                            sh('git config --local credential.helper "!f() { echo username=\\$GIT_USERNAME; echo password=\\$GIT_PASSWORD; }; f"')
+                            sh('git config --global push.default simple')
+                            sh("git commit --allow-empty -am 'Updated: Role ${GIT_REPO} to version ${newRoleVersion}'")
+                            sh("git tag $newVersion;git push --tags origin HEAD:master")
+                    }
+                }
+            }
+            post {
+                always {
+                    deleteDir()
+                }
+            }
+        }
+
+        stage('Update Middleware roles/requirements') {
+             when {
+                    allOf {
+                        branch 'develop';
+                        expression {
+                            GIT_REPO.startsWith("mdw-") // || GIT_REPO.equals("sys-sudoers")
+                        }
+                    }
+
+            }
+
+            steps {
+
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "master"]],
+                    doGenerateSubmoduleConfigurations: false,
+                    extensions: [],
+                    submoduleCfg: [],
+                    userRemoteConfigs: [[credentialsId: 'svccldprvans', url: "${MIDDLEWARE_URL}"]]
+                ])
+                script {
+// TODO: WARNING IF ROLE NOT IN REQUIREMENTS
+                    def filename = 'roles/requirements.yml'
+                    def data = readYaml file: filename
+                    // if !data.contains(GIT_REPO) { buildWarn }
+                    data.eachWithIndex { req, index  ->
+                      repoName=req.getAt('name').toString()
+                      version=req.getAt('version').toString()
+                      if( repoName == GIT_REPO) {
+                         println data
+                         println repoName
+                         data[index].version = newRoleVersion
+                      }
+                    }
+                    sh "rm $filename"
+                    writeYaml file: filename, data: data
+
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'svccldprvans', usernameVariable: 'GIT_USERNAME', passwordVariable: 'GIT_PASSWORD']]) {
+                            def latestVersion = sh(
+                                        returnStdout: true,
+                                        script: 'git describe --tags "$(git rev-list --tags --max-count=1 2> /dev/null)" 2> /dev/null || echo v0'
+                                    )
+
+                            newVersion = "v" + (Integer.parseInt(latestVersion.trim().substring(1)) + 1)
+                            currentBuild.description += " Middleware Tag : ${newVersion}"
+                            sh('git config --global user.email "jenkins-ci@bpce-it.fr"')
+                            sh('git config --global user.name "Jenkins CI"')
+                            sh('git config --local credential.helper "!f() { echo username=\\$GIT_USERNAME; echo password=\\$GIT_PASSWORD; }; f"')
+                            sh('git config --global push.default simple')
+                            sh("git commit --allow-empty -am 'Updated: Role ${GIT_REPO} to version ${newRoleVersion}'")
+                            sh("git tag $newVersion;git push --tags origin HEAD:master")
+                    }
+                }
+            }
+            post {
+                always {
+                    deleteDir()
+                }
+            }
+        }
+    } // Stages Block
+} // Pipeline Block
